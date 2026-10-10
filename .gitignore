@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.jpg
+*.jpeg
+*.png
+*.npy
+index/
+results.html
+index_data/
+.vscode/
+r2.html
