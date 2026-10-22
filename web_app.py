@@ -2,12 +2,16 @@
 """Run a local browser interface for searching an existing CLIP image index."""
 
 import argparse
+import hmac
 import io
 import html
 import json
 import mimetypes
+import os
 import secrets
 import threading
+import time
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from email import policy
 from email.parser import BytesParser
@@ -23,6 +27,79 @@ import open_clip
 from search import build_text_embedding, lexical_match_score
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+SESSION_TTL_SECONDS = 12 * 60 * 60
+
+
+def render_login_page(error=""):
+  message = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
+  return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in - MIG Visual Search</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: #20251f;
+      font-family: Inter, "Segoe UI", sans-serif;
+      background: #f4f5f2;
+    }}
+    .login-card {{
+      width: min(100%, 420px);
+      padding: 32px;
+      border: 1px solid #e3e6df;
+      border-radius: 16px;
+      background: #fff;
+      box-shadow: 0 12px 40px rgba(30, 45, 30, .08);
+    }}
+    h1 {{ margin: 0; font-size: 1.6rem; }}
+    .intro {{ margin: 8px 0 24px; color: #727a70; }}
+    label {{ display: block; margin: 16px 0 6px; font-weight: 600; }}
+    input {{
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #d9ded5;
+      border-radius: 9px;
+      font: inherit;
+    }}
+    input:focus {{ border-color: #477a55; outline: 2px solid rgba(71, 122, 85, .16); }}
+    button {{
+      width: 100%;
+      margin-top: 22px;
+      padding: 12px;
+      border: 0;
+      border-radius: 9px;
+      color: #fff;
+      background: #477a55;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    button:hover {{ background: #315c3d; }}
+    .error {{ color: #a12622; }}
+  </style>
+</head>
+<body>
+  <main class="login-card">
+    <h1>MIG Visual Search</h1>
+    <p class="intro">Sign in to continue.</p>
+    {message}
+    <form action="/login" method="post">
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required autofocus>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>"""
 
 
 def render_page(
@@ -150,6 +227,8 @@ def render_page(
     .brand {{ display: flex; align-items: center; gap: 10px; color: var(--text); font-size: 1.31rem; font-weight: 750; letter-spacing: .12em; }}
     .brand-mark {{ width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }}
     .brand-logo {{ width: 75px; height: auto; }}
+    .logout-row {{ display: flex; justify-content: flex-end; margin: -18px auto 14px; }}
+    .logout-button {{ padding: 7px 11px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: #fff; font: inherit; cursor: pointer; }}
     .eyebrow {{ color: var(--muted); font-size: .82rem; }}
     h1 {{ max-width: 1380px; margin: 0 auto; font-size: clamp(1.8rem, 3vw, 2.5rem); letter-spacing: -.045em; line-height: 1.12; }}
     .intro {{ max-width: 1380px; margin: 10px auto 22px; color: var(--muted); line-height: 1.55; }}
@@ -278,6 +357,9 @@ def render_page(
         <div class="brand"><img class="brand-logo" src="https://mediaindia.eu/wp-content/themes/mig_theme/assets/images/mig-logo-200x140.png" alt="MIG"><span class="brand-mark" aria-hidden="true"></span>MIG VISUAL SEARCH</div>
          <span class="eyebrow"></span>
       </header>
+      <form class="logout-row" action="/logout" method="post">
+        <button class="logout-button" type="submit">Sign out</button>
+      </form>
       <h1>Your visual library, searchable.</h1>
       <p class="intro">Find images by name, place, or what’s in the scene — or search with a reference image.</p>
       <form class="search-form" action="/" method="get">
@@ -358,6 +440,7 @@ def render_page(
       try {{
         const response = await fetch("/index-status");
         const job = await response.json();
+        if (!response.ok) throw new Error(job.error || "Could not load indexing status.");
         if (job.status === "scanning" || job.status === "indexing") {{
           indexStatus.textContent = job.status === "scanning"
             ? "Scanning folder..."
@@ -405,10 +488,14 @@ def make_handler(
   preprocess,
   min_score,
   result_count,
+  login_username,
+  login_password,
   index_dir=None,
   scan_folder="",
 ):
   image_queries = {}
+  sessions = {}
+  sessions_lock = threading.Lock()
   state = {
     "paths": paths,
     "vectors": vectors,
@@ -419,6 +506,25 @@ def make_handler(
   index_meta = {}
   if index_dir is not None and (index_dir / "meta.json").exists():
     index_meta = json.loads((index_dir / "meta.json").read_text(encoding="utf-8"))
+
+  def session_for_request(handler):
+    cookie = SimpleCookie()
+    try:
+      cookie.load(handler.headers.get("Cookie", ""))
+    except CookieError:
+      return None
+    morsel = cookie.get("MIGVisualSession")
+    if morsel is None:
+      return None
+    token = morsel.value
+    now = time.monotonic()
+    with sessions_lock:
+      expired = [key for key, expiry in sessions.items() if expiry <= now]
+      for key in expired:
+        del sessions[key]
+      if sessions.get(token, 0) <= now:
+        return None
+    return token
 
   def index_folder(folder):
     try:
@@ -490,8 +596,90 @@ def make_handler(
         state["job"] = {"status": "error", "new_count": 0, "message": f"Indexing failed: {exc}"}
 
   class SearchHandler(BaseHTTPRequestHandler):
+    def redirect(self, location):
+      self.send_response(303)
+      self.send_header("Location", location)
+      self.send_header("Cache-Control", "no-store")
+      self.send_header("Content-Length", "0")
+      self.end_headers()
+
+    def do_login(self):
+      if session_for_request(self):
+        self.redirect("/")
+        return
+      try:
+        content_length = int(self.headers.get("Content-Length", "0"))
+      except ValueError:
+        content_length = 0
+      if content_length < 1 or content_length > 8192:
+        self.send_page(render_login_page("Invalid login request."), 400)
+        return
+      form = parse_qs(
+        self.rfile.read(content_length).decode("utf-8", errors="replace"),
+        keep_blank_values=True,
+      )
+      supplied_username = form.get("username", [""])[0]
+      supplied_password = form.get("password", [""])[0]
+      username_matches = hmac.compare_digest(
+        supplied_username.encode("utf-8"), login_username.encode("utf-8")
+      )
+      password_matches = hmac.compare_digest(
+        supplied_password.encode("utf-8"), login_password.encode("utf-8")
+      )
+      if not (username_matches and password_matches):
+        self.send_page(
+          render_login_page("Wrong credentials, please try again."),
+          401,
+        )
+        return
+
+      token = secrets.token_urlsafe(32)
+      with sessions_lock:
+        sessions[token] = time.monotonic() + SESSION_TTL_SECONDS
+      self.send_response(303)
+      self.send_header("Location", "/")
+      self.send_header(
+        "Set-Cookie",
+        f"MIGVisualSession={token}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "
+        "HttpOnly; SameSite=Strict",
+      )
+      self.send_header("Cache-Control", "no-store")
+      self.send_header("Content-Length", "0")
+      self.end_headers()
+
+    def do_logout(self):
+      token = session_for_request(self)
+      if token:
+        with sessions_lock:
+          sessions.pop(token, None)
+      self.send_response(303)
+      self.send_header("Location", "/login")
+      self.send_header(
+        "Set-Cookie",
+        "MIGVisualSession=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
+      )
+      self.send_header("Cache-Control", "no-store")
+      self.send_header("Content-Length", "0")
+      self.end_headers()
+
     def do_GET(self):
       request = urlsplit(self.path)
+      authenticated = session_for_request(self) is not None
+      if request.path == "/login":
+        if authenticated:
+          self.redirect("/")
+        else:
+          self.send_page(render_login_page())
+        return
+      if request.path == "/logout":
+        self.send_error(405)
+        return
+      if not authenticated:
+        if request.path == "/index-status":
+          self.send_json({"error": "Please sign in."}, 401)
+        else:
+          self.redirect("/login")
+        return
       if request.path == "/index-status":
         with state_lock:
           job = dict(state["job"])
@@ -606,6 +794,18 @@ def make_handler(
 
     def do_POST(self):
       request_path = urlsplit(self.path).path
+      if request_path == "/login":
+        self.do_login()
+        return
+      if request_path == "/logout":
+        self.do_logout()
+        return
+      if session_for_request(self) is None:
+        if request_path == "/index":
+          self.send_json({"error": "Please sign in."}, 401)
+        else:
+          self.redirect("/login")
+        return
       if request_path == "/index":
         self.index_new_folder()
         return
@@ -634,7 +834,7 @@ def make_handler(
           if part.get_content_disposition() != "form-data":
             continue
           field_name = part.get_param("name", header="content-disposition")
-          if field_name == "image":
+          if  field_name == "image":
             image_bytes = part.get_payload(decode=True)
           elif field_name == "folder":
             folder_value = (part.get_payload(decode=True) or b"").decode(
@@ -683,6 +883,7 @@ def make_handler(
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(image_file.seek(0, 2)))
+        self.send_header("Cache-Control", "private, no-store")
         if download:
           self.send_header(
             "Content-Disposition",
@@ -709,6 +910,7 @@ def make_handler(
       self.send_response(status)
       self.send_header("Content-Type", "text/html; charset=utf-8")
       self.send_header("Content-Length", str(len(content)))
+      self.send_header("Cache-Control", "no-store")
       self.end_headers()
       self.wfile.write(content)
 
@@ -717,6 +919,7 @@ def make_handler(
       self.send_response(status)
       self.send_header("Content-Type", "application/json; charset=utf-8")
       self.send_header("Content-Length", str(len(content)))
+      self.send_header("Cache-Control", "no-store")
       self.end_headers()
       self.wfile.write(content)
 
@@ -780,6 +983,13 @@ def main():
         parser.error("-k must be at least 1")
     if not 0.0 <= args.min_score <= 1.0:
         parser.error("--min-score must be between 0 and 1")
+    login_username = os.environ.get("MIG_VISUAL_SEARCH_USERNAME")
+    login_password = os.environ.get("MIG_VISUAL_SEARCH_PASSWORD")
+    if not login_username or not login_password:
+        parser.error(
+            "Set both MIG_VISUAL_SEARCH_USERNAME and MIG_VISUAL_SEARCH_PASSWORD "
+            "environment variables before starting the app"
+        )
 
     index = Path(args.index)
     metadata = json.loads((index / "meta.json").read_text(encoding="utf-8"))
@@ -808,6 +1018,8 @@ def main():
         preprocess,
         args.min_score,
         args.k,
+        login_username,
+        login_password,
         index,
         args.scan_folder,
       ),
