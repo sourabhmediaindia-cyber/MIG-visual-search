@@ -58,22 +58,21 @@ def text_query_variants(text, prompt_template="a photo of {}"):
     if not raw:
         return [""]
     cleaned = normalize_query_text(raw)
-    variants = {raw, cleaned, cleaned.replace(" ", "_"), cleaned.replace(" ", "-")}
-    variants.update({
+    variants = (
+        raw,
         prompt_template.format(cleaned),
         f"an image of {cleaned}",
-        f"a high quality photo of {cleaned}",
-        f"{cleaned} cityscape",
-        f"{cleaned} architecture",
-    })
-    return [v for v in variants if v and v.strip()]
+        f"a photograph of {cleaned}",
+    )
+    return list(dict.fromkeys(variant for variant in variants if variant.strip()))
 
 
 def build_text_embedding(model, tokenizer, text, prompt_template="a photo of {}"):
     variants = text_query_variants(text, prompt_template)
     q = model.encode_text(tokenizer(variants))
-    q = q / q.norm(dim=-1, keepdim=True)
-    return q.mean(dim=0, keepdim=True)
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    q = q.mean(dim=0, keepdim=True)
+    return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 def main():
@@ -87,7 +86,7 @@ def main():
     ap.add_argument(
         "--min-score",
         type=float,
-        default=0.28,
+        default=0.22,
         help="minimum CLIP similarity for text results (default: 0.28)",
     )
     ap.add_argument("--html", help="write a results page with thumbnails (open in browser)")
@@ -338,7 +337,7 @@ def main():
 <body>
   <div class=\"page\">
     <header class=\"topbar\">
-      <div class=\"brand\"><span class=\"brand-mark\"></span>  MIG Visual Search</div>
+      <div class=\"brand\"><span class=\"brand-mark\"></span>  <img src="https://mediaindia.eu/wp-content/themes/mig_theme/assets/images/mig-logo-200x140.png" style="width:90px"><h2><b>MEDIA Hub</b></h2></div>
       <div class=\"query-wrap\">
         <span class=\"query-pill\">Query</span>
         <div class=\"query-text\">{html.escape(str(label), quote=True)}</div>

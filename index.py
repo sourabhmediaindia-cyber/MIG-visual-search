@@ -24,7 +24,7 @@ import open_clip
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = 300_000_000
 
-EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 GENERIC_TOKENS = {"img", "image", "images", "photo", "photos", "pic", "pics", "dsc", "jpeg", "jpg", "png", "webp", "bmp", "tif", "tiff", "camera", "shot", "picture", "media", "folder"}
 
 
