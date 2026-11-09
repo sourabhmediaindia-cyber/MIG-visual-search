@@ -20,6 +20,9 @@ import torch
 from PIL import Image
 
 import open_clip
+import pillow_heif
+
+pillow_heif.register_heif_opener()
 
 
 def normalize_query_text(value):
@@ -87,7 +90,7 @@ def main():
         "--min-score",
         type=float,
         default=0.22,
-        help="minimum CLIP similarity for text results (default: 0.28)",
+        help="minimum CLIP similarity for text results (default: 0.22)",
     )
     ap.add_argument("--html", help="write a results page with thumbnails (open in browser)")
     args = ap.parse_args()
@@ -101,6 +104,8 @@ def main():
     paths = json.loads((idx / "paths.json").read_text(encoding="utf-8"))
     vecs = np.load(idx / "vectors.npy")
     labels = json.loads((idx / "labels.json").read_text(encoding="utf-8")) if (idx / "labels.json").exists() else [[p] for p in paths]
+    ocr_texts = json.loads((idx / "ocr_text.json").read_text(encoding="utf-8")) if (idx / "ocr_text.json").exists() else []
+    ocr_texts = (ocr_texts + [""] * len(paths))[:len(paths)]
 
     model, _, preprocess = open_clip.create_model_and_transforms(meta["model"], pretrained=meta["pretrained"])
     model.eval()
@@ -119,18 +124,22 @@ def main():
     t0 = time.time()
     clip_scores = vecs @ q
     lexical_scores = np.zeros_like(clip_scores, dtype=np.float32)
+    ocr_scores = np.zeros_like(clip_scores, dtype=np.float32)
     if args.text:
         query = args.text
         lexical_scores = np.array([
             lexical_match_score(query, " ".join(labels[i]) if i < len(labels) else paths[i])
             for i in range(len(paths))
         ], dtype=np.float32)
-        mix_weight = 0.18
-        final_scores = clip_scores + mix_weight * lexical_scores
+        ocr_scores = np.array([
+            lexical_match_score(query, ocr_texts[i] or "")
+            for i in range(len(paths))
+        ], dtype=np.float32)
+        final_scores = clip_scores + 0.18 * lexical_scores + 0.45 * ocr_scores
     else:
         final_scores = clip_scores
     if args.text:
-        eligible = np.flatnonzero(clip_scores >= args.min_score)
+        eligible = np.flatnonzero((clip_scores >= args.min_score) | (ocr_scores > 0))
     else:
         eligible = np.arange(len(paths))
     top = eligible[np.argsort(-final_scores[eligible], kind="stable")[:args.k]]
@@ -166,6 +175,11 @@ def main():
                 "</div>"
                 "</article>"
             )
+        main_content = (
+            "".join(cells)
+            if cells
+            else '<p class="path">No images met the minimum similarity threshold.</p>'
+        )
         page = f"""<!doctype html>
 <html lang=\"en\">
 <head>
@@ -344,7 +358,7 @@ def main():
       </div>
       <div class=\"results-meta\">{total} results</div>
     </header>
-    <main class=\"grid\">{''.join(cells) if cells else '<p class=\"path\">No images met the minimum similarity threshold.</p>'}</main>
+    <main class=\"grid\">{main_content}</main>
   </div>
 </body>
 </html>

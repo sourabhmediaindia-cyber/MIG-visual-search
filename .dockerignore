@@ -1,0 +1,12 @@
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+index_data
+photos
+Photos
+index_data_backup
+results.html
+r2.html
+.env

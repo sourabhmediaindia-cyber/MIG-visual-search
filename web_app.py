@@ -24,6 +24,7 @@ from PIL import Image
 
 from index import ImageDS, collate, path_terms, save, scan
 import open_clip
+from ocr import create_ocr_reader, extract_ocr_text
 from search import build_text_embedding, lexical_match_score
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
@@ -115,6 +116,7 @@ def render_page(
     page_size=20,
     scan_folder="",
     broad_matches=False,
+    role="user",
 ):
     cards = []
     start_rank = (page - 1) * page_size + 1
@@ -184,6 +186,105 @@ def render_page(
             + '</nav>'
         )
 
+    panel_label = "Admin panel" if role == "admin" else "User panel"
+    admin_tools = ""
+    admin_script = ""
+    if role == "admin":
+        admin_tools = f"""
+      <section class="admin-tools" aria-labelledby="admin-title">
+        <h2 id="admin-title">Admin panel</h2>
+        <form class="upload-form" id="upload-form" enctype="multipart/form-data">
+          <label for="upload-image">Add a picture to the library</label>
+          <input class="image-input" id="upload-image" type="file" name="image"
+            accept="image/*" required aria-label="Choose a picture to add">
+          <button class="image-button" id="upload-button" type="submit">Upload and index</button>
+        </form>
+        <details class="index-tools">
+          <summary>Index a folder of pictures</summary>
+          <form class="index-form" id="index-form">
+            <input class="folder-input" id="scan-folder" type="text"
+              value="{html.escape(scan_folder, quote=True)}"
+              placeholder="Folder path containing pictures" aria-label="Folder path containing pictures" required>
+            <button class="image-button" id="index-button" type="submit">Index folder</button>
+          </form>
+        </details>
+        <p class="index-status" id="index-status" role="status" aria-live="polite"></p>
+      </section>"""
+        admin_script = """
+    const uploadForm = document.getElementById("upload-form");
+    const uploadButton = document.getElementById("upload-button");
+    const indexForm = document.getElementById("index-form");
+    const indexButton = document.getElementById("index-button");
+    const indexStatus = document.getElementById("index-status");
+
+    function setIndexingDisabled(disabled) {
+      uploadButton.disabled = disabled;
+      indexButton.disabled = disabled;
+    }
+
+    async function updateIndexStatus() {
+      try {
+        const response = await fetch("/index-status");
+        const job = await response.json();
+        if (!response.ok) throw new Error(job.error || "Could not load indexing status.");
+        if (job.status === "scanning" || job.status === "indexing") {
+          indexStatus.textContent = job.status === "scanning"
+            ? "Scanning folder..."
+            : `Indexing ${job.new_count} pictures...`;
+          window.setTimeout(updateIndexStatus, 700);
+        } else {
+          setIndexingDisabled(false);
+          indexStatus.textContent = job.message || "";
+        }
+      } catch (error) {
+        setIndexingDisabled(false);
+        indexStatus.textContent = error.message;
+      }
+    }
+
+    async function startIndexing(response) {
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Could not start indexing.");
+      setIndexingDisabled(true);
+      indexStatus.textContent = "Scanning folder...";
+      window.setTimeout(updateIndexStatus, 300);
+    }
+
+    uploadForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      setIndexingDisabled(true);
+      indexStatus.textContent = "Uploading picture...";
+      try {
+        const response = await fetch("/upload-image", {
+          method: "POST",
+          body: new FormData(uploadForm)
+        });
+        await startIndexing(response);
+        uploadForm.reset();
+      } catch (error) {
+        setIndexingDisabled(false);
+        indexStatus.textContent = error.message;
+      }
+    });
+
+    indexForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      setIndexingDisabled(true);
+      indexStatus.textContent = "Scanning folder...";
+      try {
+        const response = await fetch("/index", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder: document.getElementById("scan-folder").value })
+        });
+        await startIndexing(response);
+      } catch (error) {
+        setIndexingDisabled(false);
+        indexStatus.textContent = error.message;
+      }
+    });
+"""
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -229,6 +330,7 @@ def render_page(
     .brand-logo {{ width: 75px; height: auto; }}
     .logout-row {{ display: flex; justify-content: flex-end; margin: -18px auto 14px; }}
     .logout-button {{ padding: 7px 11px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: #fff; font: inherit; cursor: pointer; }}
+    .panel-label {{ margin: 0 0 12px; color: var(--accent-dark); font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }}
     .eyebrow {{ color: var(--muted); font-size: .82rem; }}
     h1 {{ max-width: 1380px; margin: 0 auto; font-size: clamp(1.8rem, 3vw, 2.5rem); letter-spacing: -.045em; line-height: 1.12; }}
     .intro {{ max-width: 1380px; margin: 10px auto 22px; color: var(--muted); line-height: 1.55; }}
@@ -290,7 +392,12 @@ def render_page(
     .image-preview {{ display: flex; align-items: center; gap: 10px; min-width: 0; margin-top: 10px; color: var(--muted); font-size: .82rem; }}
     .image-preview[hidden] {{ display: none; }}
     .image-preview img {{ width: 52px; height: 52px; border-radius: 9px; object-fit: cover; }}
-    .index-tools {{ max-width: 900px; margin: 16px auto 0; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); }}
+    .admin-tools {{ max-width: 900px; margin: 20px auto 0; padding: 18px; border: 1px solid var(--border); border-radius: 12px; background: #f9faf8; text-align: left; }}
+    .admin-tools h2 {{ margin: 0 0 14px; font-size: 1.05rem; }}
+    .upload-form {{ display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }}
+    .upload-form label {{ flex-basis: 100%; color: var(--text); font-size: .9rem; font-weight: 650; }}
+    .upload-form .image-input {{ flex: 1; }}
+    .index-tools {{ margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); }}
     .index-tools summary {{ width: fit-content; cursor: pointer; font-size: .87rem; }}
     .index-form {{ display: flex; gap: 10px; margin-top: 14px; }}
     .folder-input {{ flex: 1; }}
@@ -339,7 +446,7 @@ def render_page(
       .search-form {{ flex-direction: column; }}
       .search-button {{ width: 100%; }}
       .search-options {{ align-items: flex-start; flex-direction: column; }}
-      .image-form, .filters, .index-form {{ align-items: stretch; flex-direction: column; }}
+      .image-form, .filters, .index-form, .upload-form {{ align-items: stretch; flex-direction: column; }}
       .image-button {{ width: 100%; }}
       .filters .folder-select {{ max-width: none; }}
       .grid {{ grid-template-columns: repeat(auto-fill, minmax(155px, 1fr)); gap: 12px; }}
@@ -357,14 +464,15 @@ def render_page(
         <div class="brand"><img class="brand-logo" src="https://mediaindia.eu/wp-content/themes/mig_theme/assets/images/mig-logo-200x140.png" alt="MIG"><span class="brand-mark" aria-hidden="true"></span>MIG VISUAL SEARCH</div>
          <span class="eyebrow"></span>
       </header>
+      <p class="panel-label">{panel_label}</p>
       <form class="logout-row" action="/logout" method="post">
         <button class="logout-button" type="submit">Sign out</button>
       </form>
       <h1>Your visual library, searchable.</h1>
-      <p class="intro">Find images by name, place, or what’s in the scene — or search with a reference image.</p>
+      <p class="intro">Find images by name, place, or what’s in the scene —</p>
       <form class="search-form" action="/" method="get">
         <input class="search-input" type="search" name="q"
-          placeholder="Try &quot;Abu Dhabi&quot; or &quot;mosque at sunset&quot;"
+          placeholder=""
           value="{html.escape(query, quote=True)}" aria-label="Image name or tag">
         <input type="hidden" name="folder" value="{html.escape(folder, quote=True)}">
         <button class="search-button" type="submit">Search</button>
@@ -389,16 +497,7 @@ def render_page(
           <span id="image-preview-name"></span>
         </div>
       </section>
-      <details class="index-tools">
-        <summary>Add pictures to your index</summary>
-        <form class="index-form" id="index-form">
-          <input class="folder-input" id="scan-folder" type="text"
-            value="{html.escape(scan_folder, quote=True)}"
-            placeholder="Folder path containing pictures" aria-label="Folder path containing pictures" required>
-          <button class="image-button" id="index-button" type="submit">Index folder</button>
-        </form>
-        <p class="index-status" id="index-status" role="status" aria-live="polite"></p>
-      </details>
+      {admin_tools}
     </section>
     <form class="filters" action="/" method="get">
       <input type="hidden" name="q" value="{html.escape(query, quote=True)}">
@@ -431,49 +530,7 @@ def render_page(
       }}
     }});
 
-    const indexForm = document.getElementById("index-form");
-    const indexButton = document.getElementById("index-button");
-    const indexStatus = document.getElementById("index-status");
-    let pollTimer;
-
-    async function updateIndexStatus() {{
-      try {{
-        const response = await fetch("/index-status");
-        const job = await response.json();
-        if (!response.ok) throw new Error(job.error || "Could not load indexing status.");
-        if (job.status === "scanning" || job.status === "indexing") {{
-          indexStatus.textContent = job.status === "scanning"
-            ? "Scanning folder..."
-            : `Indexing ${{job.new_count}} pictures...`;
-          pollTimer = window.setTimeout(updateIndexStatus, 700);
-        }} else {{
-          indexButton.disabled = false;
-          indexStatus.textContent = job.message || "";
-        }}
-      }} catch (error) {{
-        indexButton.disabled = false;
-        indexStatus.textContent = error.message;
-      }}
-    }}
-
-    indexForm.addEventListener("submit", async (event) => {{
-      event.preventDefault();
-      indexButton.disabled = true;
-      indexStatus.textContent = "Scanning folder...";
-      try {{
-        const response = await fetch("/index", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ folder: document.getElementById("scan-folder").value }})
-        }});
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Could not start indexing.");
-        pollTimer = window.setTimeout(updateIndexStatus, 300);
-      }} catch (error) {{
-        indexButton.disabled = false;
-        indexStatus.textContent = error.message;
-      }}
-    }});
+    {admin_script}
   </script>
 </body>
 </html>"""
@@ -488,10 +545,10 @@ def make_handler(
   preprocess,
   min_score,
   result_count,
-  login_username,
-  login_password,
+  credentials,
   index_dir=None,
   scan_folder="",
+  ocr_texts=None,
 ):
   image_queries = {}
   sessions = {}
@@ -500,6 +557,7 @@ def make_handler(
     "paths": paths,
     "vectors": vectors,
     "labels": labels,
+    "ocr_texts": ocr_texts if ocr_texts is not None else [None] * len(paths),
     "job": {"status": "idle", "new_count": 0, "message": ""},
   }
   state_lock = threading.Lock()
@@ -519,12 +577,20 @@ def make_handler(
     token = morsel.value
     now = time.monotonic()
     with sessions_lock:
-      expired = [key for key, expiry in sessions.items() if expiry <= now]
+      expired = [
+        key for key, session in sessions.items()
+        if session["expires"] <= now
+      ]
       for key in expired:
         del sessions[key]
-      if sessions.get(token, 0) <= now:
+      if token not in sessions:
         return None
     return token
+
+  def role_for_session(token):
+    with sessions_lock:
+      session = sessions.get(token)
+      return session["role"] if session else None
 
   def index_folder(folder):
     try:
@@ -544,6 +610,7 @@ def make_handler(
           state["job"] = {"status": "complete", "new_count": 0, "message": "No new pictures to index."}
         return
 
+      ocr_reader = create_ocr_reader()
       loader = torch.utils.data.DataLoader(
         ImageDS(new_paths, preprocess),
         batch_size=32,
@@ -553,6 +620,7 @@ def make_handler(
       feature_batches = []
       indexed_paths = []
       indexed_labels = []
+      indexed_ocr_texts = []
       with torch.no_grad():
         for batch in loader:
           if batch is None:
@@ -564,11 +632,15 @@ def make_handler(
           batch_paths = [new_paths[index] for index in indices.tolist()]
           indexed_paths.extend(batch_paths)
           indexed_labels.extend(path_terms(path) for path in batch_paths)
+          indexed_ocr_texts.extend(
+            extract_ocr_text(ocr_reader, path) for path in batch_paths
+          )
 
       with state_lock:
         old_paths = state["paths"]
         old_vectors = state["vectors"]
         old_labels = state["labels"]
+        old_ocr_texts = state["ocr_texts"]
       combined_paths = old_paths + indexed_paths
       if feature_batches:
         new_vectors = np.concatenate(feature_batches, axis=0)
@@ -579,13 +651,24 @@ def make_handler(
       else:
         combined_vectors = old_vectors
       combined_labels = old_labels + indexed_labels
+      combined_ocr_texts = (
+        old_ocr_texts + [None] * (len(old_paths) - len(old_ocr_texts))
+      )[:len(old_paths)] + indexed_ocr_texts
       if indexed_paths and index_dir is not None:
-        save(index_dir, combined_paths, combined_vectors, index_meta, combined_labels)
+        save(
+          index_dir,
+          combined_paths,
+          combined_vectors,
+          index_meta,
+          combined_labels,
+          combined_ocr_texts,
+        )
 
       with state_lock:
         state["paths"] = combined_paths
         state["vectors"] = combined_vectors
         state["labels"] = combined_labels
+        state["ocr_texts"] = combined_ocr_texts
         state["job"] = {
           "status": "complete",
           "new_count": len(indexed_paths),
@@ -618,15 +701,19 @@ def make_handler(
         self.rfile.read(content_length).decode("utf-8", errors="replace"),
         keep_blank_values=True,
       )
-      supplied_username = form.get("username", [""])[0]
-      supplied_password = form.get("password", [""])[0]
-      username_matches = hmac.compare_digest(
-        supplied_username.encode("utf-8"), login_username.encode("utf-8")
-      )
-      password_matches = hmac.compare_digest(
-        supplied_password.encode("utf-8"), login_password.encode("utf-8")
-      )
-      if not (username_matches and password_matches):
+      supplied_username = form.get("username", [""])[0].encode("utf-8")
+      supplied_password = form.get("password", [""])[0].encode("utf-8")
+      role = None
+      for account_role, (username, password) in credentials.items():
+        username_matches = hmac.compare_digest(
+          supplied_username, username.encode("utf-8")
+        )
+        password_matches = hmac.compare_digest(
+          supplied_password, password.encode("utf-8")
+        )
+        if username_matches and password_matches:
+          role = account_role
+      if role is None:
         self.send_page(
           render_login_page("Wrong credentials, please try again."),
           401,
@@ -635,7 +722,10 @@ def make_handler(
 
       token = secrets.token_urlsafe(32)
       with sessions_lock:
-        sessions[token] = time.monotonic() + SESSION_TTL_SECONDS
+        sessions[token] = {
+          "expires": time.monotonic() + SESSION_TTL_SECONDS,
+          "role": role,
+        }
       self.send_response(303)
       self.send_header("Location", "/")
       self.send_header(
@@ -664,7 +754,9 @@ def make_handler(
 
     def do_GET(self):
       request = urlsplit(self.path)
-      authenticated = session_for_request(self) is not None
+      token = session_for_request(self)
+      role = role_for_session(token) if token else None
+      authenticated = role is not None
       if request.path == "/login":
         if authenticated:
           self.redirect("/")
@@ -675,12 +767,15 @@ def make_handler(
         self.send_error(405)
         return
       if not authenticated:
-        if request.path == "/index-status":
+        if request.path in ("/index-status",):
           self.send_json({"error": "Please sign in."}, 401)
         else:
           self.redirect("/login")
         return
       if request.path == "/index-status":
+        if role != "admin":
+          self.send_json({"error": "Admin access is required."}, 403)
+          return
         with state_lock:
           job = dict(state["job"])
         self.send_json(job)
@@ -704,7 +799,11 @@ def make_handler(
       image_query = params.get("image_query", [""])[0]
       if len(query) > 300:
         self.send_page(
-          render_page(error="Search text must be 300 characters or fewer.", scan_folder=scan_folder),
+          render_page(
+            error="Search text must be 300 characters or fewer.",
+            scan_folder=scan_folder,
+            role=role,
+          ),
           400,
         )
         return
@@ -717,6 +816,7 @@ def make_handler(
         current_paths = state["paths"]
         current_vectors = state["vectors"]
         current_labels = state["labels"]
+        current_ocr_texts = state["ocr_texts"]
       folders = sorted({Path(path).parent for path in current_paths}, key=lambda item: str(item).casefold())
       eligible = np.arange(len(current_paths))
       if folder:
@@ -738,7 +838,10 @@ def make_handler(
           query_vector = image_queries.get(image_query)
           if query_vector is None:
             self.send_page(
-              render_page(error="This image search has expired. Please upload the image again."),
+              render_page(
+                error="This image search has expired. Please upload the image again.",
+                role=role,
+              ),
               410,
             )
             return
@@ -762,9 +865,22 @@ def make_handler(
               ],
               dtype=np.float32,
             )
+            padded_ocr_texts = (
+              current_ocr_texts + [None] * (len(current_paths) - len(current_ocr_texts))
+            )[:len(current_paths)]
+            ocr_scores = np.array(
+              [
+                lexical_match_score(query, text or "")
+                for text in padded_ocr_texts
+              ],
+              dtype=np.float32,
+            )
             final_scores += 0.18 * lexical_scores
+            final_scores += 0.45 * ocr_scores
             threshold = max(0.0, min_score - 0.04) if params.get("broaden", [""])[0] == "1" else min_score
-            eligible = eligible[clip_scores[eligible] >= threshold]
+            eligible = eligible[
+              (clip_scores[eligible] >= threshold) | (ocr_scores[eligible] > 0)
+            ]
           ranked = eligible[np.argsort(-final_scores[eligible], kind="stable")]
 
         result_total = len(ranked)
@@ -789,6 +905,7 @@ def make_handler(
           page_size=result_count,
           scan_folder=scan_folder,
           broad_matches=(params.get("broaden", [""])[0] == "1"),
+          role=role,
         )
       )
 
@@ -800,14 +917,23 @@ def make_handler(
       if request_path == "/logout":
         self.do_logout()
         return
-      if session_for_request(self) is None:
-        if request_path == "/index":
+      token = session_for_request(self)
+      role = role_for_session(token) if token else None
+      admin_endpoints = ("/index", "/upload-image")
+      if role is None:
+        if request_path in admin_endpoints:
           self.send_json({"error": "Please sign in."}, 401)
         else:
           self.redirect("/login")
         return
+      if request_path in admin_endpoints and role != "admin":
+        self.send_json({"error": "Admin access is required."}, 403)
+        return
       if request_path == "/index":
         self.index_new_folder()
+        return
+      if request_path == "/upload-image":
+        self.upload_image()
         return
       if request_path != "/search-image":
         self.send_error(404)
@@ -817,7 +943,10 @@ def make_handler(
       except ValueError:
         content_length = 0
       if content_length < 1 or content_length > MAX_UPLOAD_BYTES:
-        self.send_page(render_page(error="Upload an image smaller than 15 MB."), 413)
+        self.send_page(
+          render_page(error="Upload an image smaller than 15 MB.", role=role),
+          413,
+        )
         return
 
       content_type = self.headers.get("Content-Type", "")
@@ -841,7 +970,7 @@ def make_handler(
               "utf-8", errors="replace"
             )
       if not image_bytes:
-        self.send_page(render_page(error="Choose a valid image to search."), 400)
+        self.send_page(render_page(error="Choose a valid image to search.", role=role), 400)
         return
 
       try:
@@ -857,7 +986,13 @@ def make_handler(
         while len(image_queries) > 32:
           image_queries.pop(next(iter(image_queries)))
       except Exception:
-        self.send_page(render_page(error="The uploaded file could not be read as an image."), 400)
+        self.send_page(
+          render_page(
+            error="The uploaded file could not be read as an image.",
+            role=role,
+          ),
+          400,
+        )
         return
 
       self.send_response(303)
@@ -878,6 +1013,26 @@ def make_handler(
         self.send_error(404)
         return
       image_path = Path(current_paths[int(image_id)])
+      browser_image_extensions = {".jpg", ".jpeg", ".jfif", ".png", ".gif", ".webp"}
+      if not download and image_path.suffix.lower() not in browser_image_extensions:
+        try:
+          with Image.open(image_path) as preview:
+            preview.seek(0)
+            preview.thumbnail((2048, 2048))
+            preview = preview.convert("RGB")
+            output = io.BytesIO()
+            preview.save(output, format="JPEG", quality=88)
+            content = output.getvalue()
+        except (OSError, ValueError):
+          self.send_error(415, "Unable to create a browser preview for this image.")
+          return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.end_headers()
+        self.wfile.write(content)
+        return
       content_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
       with image_path.open("rb") as image_file:
         self.send_response(200)
@@ -941,18 +1096,102 @@ def make_handler(
         self.send_json({"error": str(exc)}, 400)
         return
 
+      if not self.reserve_index_job():
+        self.send_json({"error": "Indexing is already in progress."}, 409)
+        return
+      try:
+        self.launch_index_job(str(folder_path.resolve()))
+      except RuntimeError as exc:
+        self.fail_reserved_job(f"Could not start indexing: {exc}")
+        self.send_json({"error": f"Could not start indexing: {exc}"}, 500)
+        return
+      self.send_json({"status": "started"}, 202)
+
+    def upload_image(self):
+      if index_dir is None:
+        self.send_json({"error": "Image uploads require a configured index directory."}, 503)
+        return
+      try:
+        content_length = int(self.headers.get("Content-Length", "0"))
+      except ValueError:
+        content_length = 0
+      if content_length < 1 or content_length > MAX_UPLOAD_BYTES:
+        self.send_json({"error": "Upload a picture smaller than 15 MB."}, 413)
+        return
+
+      content_type = self.headers.get("Content-Type", "")
+      headers = (
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n"
+      ).encode("latin-1", errors="replace")
+      message = BytesParser(policy=policy.default).parsebytes(
+        headers + self.rfile.read(content_length)
+      )
+      image_bytes = None
+      if message.is_multipart():
+        for part in message.iter_parts():
+          if (
+            part.get_content_disposition() == "form-data"
+            and part.get_param("name", header="content-disposition") == "image"
+          ):
+            image_bytes = part.get_payload(decode=True)
+            break
+      if not image_bytes:
+        self.send_json({"error": "Choose a picture to upload."}, 400)
+        return
+
+      try:
+        with Image.open(io.BytesIO(image_bytes)) as uploaded:
+          if uploaded.width * uploaded.height > 100_000_000:
+            raise ValueError("Image dimensions are too large.")
+          uploaded.verify()
+        with Image.open(io.BytesIO(image_bytes)) as uploaded:
+          image = uploaded.convert("RGB")
+      except (OSError, ValueError, Image.DecompressionBombError):
+        self.send_json({"error": "The uploaded file is not a valid supported picture."}, 400)
+        return
+
+      if not self.reserve_index_job():
+        self.send_json({"error": "Indexing is already in progress."}, 409)
+        return
+
+      upload_dir = index_dir / "uploads"
+      image_path = upload_dir / f"{secrets.token_hex(16)}.jpg"
+      temporary_path = image_path.with_suffix(".tmp")
+      try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        image.save(temporary_path, format="JPEG", quality=95)
+        os.replace(temporary_path, image_path)
+      except OSError as exc:
+        self.fail_reserved_job(f"Could not save uploaded picture: {exc}")
+        self.send_json({"error": f"Could not save uploaded picture: {exc}"}, 500)
+        return
+
+      try:
+        self.launch_index_job(str(upload_dir.resolve()))
+      except RuntimeError as exc:
+        self.fail_reserved_job(f"Could not start indexing: {exc}")
+        self.send_json({"error": f"Picture was saved but indexing could not start: {exc}"}, 500)
+        return
+      self.send_json({"status": "started"}, 202)
+
+    def reserve_index_job(self):
       with state_lock:
         if state["job"]["status"] in ("scanning", "indexing"):
-          self.send_json({"error": "Indexing is already in progress."}, 409)
-          return
+          return False
         state["job"] = {"status": "scanning", "new_count": 0, "message": ""}
-        thread = threading.Thread(
-          target=index_folder,
-          args=(str(folder_path.resolve()),),
-          daemon=True,
-        )
-        thread.start()
-      self.send_json({"status": "started"}, 202)
+      return True
+
+    def launch_index_job(self, folder):
+      thread = threading.Thread(
+        target=index_folder,
+        args=(folder,),
+        daemon=True,
+      )
+      thread.start()
+
+    def fail_reserved_job(self, message):
+      with state_lock:
+        state["job"] = {"status": "error", "new_count": 0, "message": message}
 
     def log_message(self, format_string, *args):
       print(f"{self.address_string()} - {format_string % args}")
@@ -983,13 +1222,28 @@ def main():
         parser.error("-k must be at least 1")
     if not 0.0 <= args.min_score <= 1.0:
         parser.error("--min-score must be between 0 and 1")
-    login_username = os.environ.get("MIG_VISUAL_SEARCH_USERNAME")
-    login_password = os.environ.get("MIG_VISUAL_SEARCH_PASSWORD")
-    if not login_username or not login_password:
+    admin_username = (
+      os.environ.get("MIG_VISUAL_SEARCH_ADMIN_USERNAME")
+      or os.environ.get("MIG_VISUAL_SEARCH_USERNAME")
+    )
+    admin_password = (
+      os.environ.get("MIG_VISUAL_SEARCH_ADMIN_PASSWORD")
+      or os.environ.get("MIG_VISUAL_SEARCH_PASSWORD")
+    )
+    user_username = os.environ.get("MIG_VISUAL_SEARCH_USER_USERNAME")
+    user_password = os.environ.get("MIG_VISUAL_SEARCH_USER_PASSWORD")
+    if not admin_username or not admin_password or not user_username or not user_password:
         parser.error(
-            "Set both MIG_VISUAL_SEARCH_USERNAME and MIG_VISUAL_SEARCH_PASSWORD "
-            "environment variables before starting the app"
+            "Set admin and user credentials with MIG_VISUAL_SEARCH_ADMIN_USERNAME, "
+            "MIG_VISUAL_SEARCH_ADMIN_PASSWORD, MIG_VISUAL_SEARCH_USER_USERNAME, and "
+            "MIG_VISUAL_SEARCH_USER_PASSWORD before starting the app"
         )
+    if admin_username == user_username:
+        parser.error("Admin and user usernames must be different")
+    credentials = {
+      "admin": (admin_username, admin_password),
+      "user": (user_username, user_password),
+    }
 
     index = Path(args.index)
     metadata = json.loads((index / "meta.json").read_text(encoding="utf-8"))
@@ -1000,6 +1254,12 @@ def main():
         if (index / "labels.json").exists()
         else [[path] for path in paths]
     )
+    ocr_texts = (
+      json.loads((index / "ocr_text.json").read_text(encoding="utf-8"))
+      if (index / "ocr_text.json").exists()
+      else [None] * len(paths)
+    )
+    ocr_texts = (ocr_texts + [None] * len(paths))[:len(paths)]
     print(f"Loading {metadata['model']} ({metadata['pretrained']})...")
     model, _, preprocess = open_clip.create_model_and_transforms(
         metadata["model"], pretrained=metadata["pretrained"]
@@ -1018,10 +1278,10 @@ def main():
         preprocess,
         args.min_score,
         args.k,
-        login_username,
-        login_password,
+        credentials,
         index,
         args.scan_folder,
+        ocr_texts,
       ),
     )
     if args.host == "0.0.0.0":

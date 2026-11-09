@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MIG_VISUAL_SEARCH_ADMIN_USERNAME: "${MIG_VISUAL_SEARCH_ADMIN_USERNAME:-${MIG_VISUAL_SEARCH_USERNAME:?Set admin credentials in .env}}"
+      MIG_VISUAL_SEARCH_ADMIN_PASSWORD: "${MIG_VISUAL_SEARCH_ADMIN_PASSWORD:-${MIG_VISUAL_SEARCH_PASSWORD:?Set admin credentials in .env}}"
+      MIG_VISUAL_SEARCH_USER_USERNAME: "${MIG_VISUAL_SEARCH_USER_USERNAME:?Set MIG_VISUAL_SEARCH_USER_USERNAME in .env}"
+      MIG_VISUAL_SEARCH_USER_PASSWORD: "${MIG_VISUAL_SEARCH_USER_PASSWORD:?Set MIG_VISUAL_SEARCH_USER_PASSWORD in .env}"
+    volumes:
+      - ./index_data:/app/index_data
+      - ./Photos:/photos:ro
+      - model-cache:/root/.cache/torch
+    restart: unless-stopped
+
+volumes:
+  model-cache:

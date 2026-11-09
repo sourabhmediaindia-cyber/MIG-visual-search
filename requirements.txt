@@ -1,4 +1,6 @@
 torch
 open_clip_torch
 pillow
+pillow-heif
 numpy
+easyocr

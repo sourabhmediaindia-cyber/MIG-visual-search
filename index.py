@@ -20,11 +20,24 @@ import torch
 from PIL import Image, ImageFile
 
 import open_clip
+import pillow_heif
+from ocr import create_ocr_reader, extract_ocr_text, save_ocr_texts
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = 300_000_000
+pillow_heif.register_heif_opener()
 
-EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+REGISTERED_EXTENSIONS = Image.registered_extensions()
+IMAGE_FORMATS = {
+    image_format
+    for image_format, mime_type in Image.MIME.items()
+    if mime_type.startswith("image/")
+}
+EXTS = {
+    extension.lower()
+    for extension, image_format in REGISTERED_EXTENSIONS.items()
+    if image_format in IMAGE_FORMATS
+}
 GENERIC_TOKENS = {"img", "image", "images", "photo", "photos", "pic", "pics", "dsc", "jpeg", "jpg", "png", "webp", "bmp", "tif", "tiff", "camera", "shot", "picture", "media", "folder"}
 
 
@@ -90,7 +103,7 @@ def scan(folder):
     return found
 
 
-def save(out, paths, vecs, meta, labels=None):
+def save(out, paths, vecs, meta, labels=None, ocr_texts=None):
     out.mkdir(parents=True, exist_ok=True)
     tmp_v = out / "vectors.tmp.npy"
     np.save(tmp_v, vecs.astype(np.float32))
@@ -103,6 +116,8 @@ def save(out, paths, vecs, meta, labels=None):
     tmp_l = out / "labels.tmp.json"
     tmp_l.write_text(json.dumps(labels), encoding="utf-8")
     os.replace(tmp_l, out / "labels.json")
+    if ocr_texts is not None:
+        save_ocr_texts(out, ocr_texts)
     (out / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
 
@@ -121,7 +136,7 @@ def main():
     out = Path(args.out)
     meta = {"model": args.model, "pretrained": args.pretrained}
 
-    paths, vecs, labels = [], np.zeros((0, 0), dtype=np.float32), []
+    paths, vecs, labels, ocr_texts = [], np.zeros((0, 0), dtype=np.float32), [], []
     if (out / "paths.json").exists() and (out / "vectors.npy").exists():
         old_meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
         if old_meta != meta:
@@ -129,6 +144,8 @@ def main():
         paths = json.loads((out / "paths.json").read_text(encoding="utf-8"))
         vecs = np.load(out / "vectors.npy")
         labels = json.loads((out / "labels.json").read_text(encoding="utf-8")) if (out / "labels.json").exists() else [path_terms(p) for p in paths]
+        ocr_texts = json.loads((out / "ocr_text.json").read_text(encoding="utf-8")) if (out / "ocr_text.json").exists() else [None] * len(paths)
+        ocr_texts.extend([None] * (len(paths) - len(ocr_texts)))
         print(f"Resuming: {len(paths)} images already indexed")
 
     print("Scanning folder...")
@@ -147,6 +164,7 @@ def main():
     torch.set_num_threads(os.cpu_count() or 4)
     model, _, preprocess = open_clip.create_model_and_transforms(args.model, pretrained=args.pretrained)
     model.eval()
+    ocr_reader = create_ocr_reader()
 
     dl = torch.utils.data.DataLoader(
         ImageDS(new_paths, preprocess),
@@ -155,21 +173,22 @@ def main():
         collate_fn=collate,
     )
 
-    feats_buf, paths_buf, labels_buf = [], [], []
+    feats_buf, paths_buf, labels_buf, ocr_buf = [], [], [], []
     processed = 0
     since_ckpt = 0
     t0 = time.time()
 
     def flush():
-        nonlocal paths, vecs, feats_buf, paths_buf, labels, labels_buf
+        nonlocal paths, vecs, feats_buf, paths_buf, labels, labels_buf, ocr_buf
         if not feats_buf:
             return
         new_v = np.concatenate(feats_buf, axis=0)
         vecs = new_v if vecs.size == 0 else np.concatenate([vecs, new_v], axis=0)
         paths = paths + paths_buf
         labels = labels + labels_buf
-        feats_buf, paths_buf, labels_buf = [], [], []
-        save(out, paths, vecs, meta, labels)
+        ocr_texts.extend(ocr_buf)
+        feats_buf, paths_buf, labels_buf, ocr_buf = [], [], [], []
+        save(out, paths, vecs, meta, labels, ocr_texts)
 
     with torch.no_grad():
         for batch in dl:
@@ -182,6 +201,7 @@ def main():
             batch_paths = [new_paths[i] for i in idx.tolist()]
             paths_buf.extend(batch_paths)
             labels_buf.extend(path_terms(p) for p in batch_paths)
+            ocr_buf.extend(extract_ocr_text(ocr_reader, path) for path in batch_paths)
             processed += len(idx)
             since_ckpt += len(idx)
             if since_ckpt >= args.checkpoint:
