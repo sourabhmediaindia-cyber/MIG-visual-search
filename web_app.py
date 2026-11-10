@@ -208,6 +208,8 @@ def render_page(
             <button class="image-button" id="index-button" type="submit">Index folder</button>
           </form>
         </details>
+        <progress class="index-progress" id="index-progress" max="1" value="0"
+          aria-label="Image indexing progress" hidden></progress>
         <p class="index-status" id="index-status" role="status" aria-live="polite"></p>
       </section>"""
         admin_script = """
@@ -216,6 +218,7 @@ def render_page(
     const indexForm = document.getElementById("index-form");
     const indexButton = document.getElementById("index-button");
     const indexStatus = document.getElementById("index-status");
+    const indexProgress = document.getElementById("index-progress");
 
     function setIndexingDisabled(disabled) {
       uploadButton.disabled = disabled;
@@ -228,16 +231,28 @@ def render_page(
         const job = await response.json();
         if (!response.ok) throw new Error(job.error || "Could not load indexing status.");
         if (job.status === "scanning" || job.status === "indexing") {
-          indexStatus.textContent = job.status === "scanning"
-            ? "Scanning folder..."
-            : `Indexing ${job.new_count} pictures...`;
+          if (job.status === "scanning") {
+            indexStatus.textContent = "Scanning folder...";
+            indexProgress.hidden = true;
+          } else {
+            const total = job.total_count || job.new_count;
+            const processed = job.processed_count || 0;
+            const percent = total ? Math.floor(processed / total * 100) : 0;
+            indexStatus.textContent =
+              `Indexing ${processed} / ${total} pictures (${percent}%)...`;
+            indexProgress.max = total || 1;
+            indexProgress.value = processed;
+            indexProgress.hidden = false;
+          }
           window.setTimeout(updateIndexStatus, 700);
         } else {
           setIndexingDisabled(false);
+          indexProgress.hidden = true;
           indexStatus.textContent = job.message || "";
         }
       } catch (error) {
         setIndexingDisabled(false);
+        indexProgress.hidden = true;
         indexStatus.textContent = error.message;
       }
     }
@@ -246,6 +261,7 @@ def render_page(
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Could not start indexing.");
       setIndexingDisabled(true);
+      indexProgress.hidden = true;
       indexStatus.textContent = "Scanning folder...";
       window.setTimeout(updateIndexStatus, 300);
     }
@@ -401,6 +417,8 @@ def render_page(
     .index-tools summary {{ width: fit-content; cursor: pointer; font-size: .87rem; }}
     .index-form {{ display: flex; gap: 10px; margin-top: 14px; }}
     .folder-input {{ flex: 1; }}
+    .index-progress {{ display: block; width: 100%; height: 8px; margin-top: 10px; accent-color: var(--accent); }}
+    .index-progress[hidden] {{ display: none; }}
     .index-status {{ min-height: 1.4em; margin: 10px 0 0; color: var(--muted); }}
     .results-meta {{ display: flex; align-items: baseline; gap: 8px; margin: 0 0 20px; color: var(--muted); }}
     .empty-results-meta {{ justify-content: center; }}
@@ -558,7 +576,13 @@ def make_handler(
     "vectors": vectors,
     "labels": labels,
     "ocr_texts": ocr_texts if ocr_texts is not None else [None] * len(paths),
-    "job": {"status": "idle", "new_count": 0, "message": ""},
+    "job": {
+      "status": "idle",
+      "new_count": 0,
+      "processed_count": 0,
+      "total_count": 0,
+      "message": "",
+    },
   }
   state_lock = threading.Lock()
   index_meta = {}
@@ -593,9 +617,17 @@ def make_handler(
       return session["role"] if session else None
 
   def index_folder(folder):
+    processed_count = 0
+    total_count = 0
     try:
       with state_lock:
-        state["job"] = {"status": "scanning", "new_count": 0, "message": ""}
+        state["job"] = {
+          "status": "scanning",
+          "new_count": 0,
+          "processed_count": 0,
+          "total_count": 0,
+          "message": "",
+        }
       found_paths = scan(folder)
       with state_lock:
         known_paths = {str(Path(path).resolve()).casefold() for path in state["paths"]}
@@ -603,11 +635,24 @@ def make_handler(
         path for path in found_paths
         if str(Path(path).resolve()).casefold() not in known_paths
       ]
+      total_count = len(new_paths)
       with state_lock:
-        state["job"] = {"status": "indexing", "new_count": len(new_paths), "message": ""}
+        state["job"] = {
+          "status": "indexing",
+          "new_count": total_count,
+          "processed_count": processed_count,
+          "total_count": total_count,
+          "message": "",
+        }
       if not new_paths:
         with state_lock:
-          state["job"] = {"status": "complete", "new_count": 0, "message": "No new pictures to index."}
+          state["job"] = {
+            "status": "complete",
+            "new_count": 0,
+            "processed_count": 0,
+            "total_count": 0,
+            "message": "No new pictures to index.",
+          }
         return
 
       ocr_reader = create_ocr_reader()
@@ -632,9 +677,11 @@ def make_handler(
           batch_paths = [new_paths[index] for index in indices.tolist()]
           indexed_paths.extend(batch_paths)
           indexed_labels.extend(path_terms(path) for path in batch_paths)
-          indexed_ocr_texts.extend(
-            extract_ocr_text(ocr_reader, path) for path in batch_paths
-          )
+          for path in batch_paths:
+            indexed_ocr_texts.append(extract_ocr_text(ocr_reader, path))
+            processed_count += 1
+            with state_lock:
+              state["job"]["processed_count"] = processed_count
 
       with state_lock:
         old_paths = state["paths"]
@@ -672,11 +719,19 @@ def make_handler(
         state["job"] = {
           "status": "complete",
           "new_count": len(indexed_paths),
+          "processed_count": processed_count,
+          "total_count": total_count,
           "message": f"Indexed {len(indexed_paths)} new pictures.",
         }
     except Exception as exc:
       with state_lock:
-        state["job"] = {"status": "error", "new_count": 0, "message": f"Indexing failed: {exc}"}
+        state["job"] = {
+          "status": "error",
+          "new_count": 0,
+          "processed_count": processed_count,
+          "total_count": total_count,
+          "message": f"Indexing failed: {exc}",
+        }
 
   class SearchHandler(BaseHTTPRequestHandler):
     def redirect(self, location):
@@ -1178,7 +1233,13 @@ def make_handler(
       with state_lock:
         if state["job"]["status"] in ("scanning", "indexing"):
           return False
-        state["job"] = {"status": "scanning", "new_count": 0, "message": ""}
+        state["job"] = {
+          "status": "scanning",
+          "new_count": 0,
+          "processed_count": 0,
+          "total_count": 0,
+          "message": "",
+        }
       return True
 
     def launch_index_job(self, folder):
@@ -1191,7 +1252,13 @@ def make_handler(
 
     def fail_reserved_job(self, message):
       with state_lock:
-        state["job"] = {"status": "error", "new_count": 0, "message": message}
+        state["job"] = {
+          "status": "error",
+          "new_count": 0,
+          "processed_count": 0,
+          "total_count": 0,
+          "message": message,
+        }
 
     def log_message(self, format_string, *args):
       print(f"{self.address_string()} - {format_string % args}")
